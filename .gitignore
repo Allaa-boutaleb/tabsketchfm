@@ -1,2 +1,9 @@
 data/
+processed_data/
+lightning_logs/
 **/__pycache__/
+tabsketchfm_env/
+models/
+vectors/
+
+*.log

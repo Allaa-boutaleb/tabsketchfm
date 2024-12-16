@@ -3,151 +3,134 @@ import json
 import pickle
 import bz2
 import random
-import shutil
+import pandas as pd
 from pathlib import Path
+from tabsketchfm.data_processing.data_prep import prep_data
+import shutil
 
-def create_metadata(csv_path):
-    """Create a simple metadata file for a CSV."""
-    return {
-        "table_name": os.path.basename(csv_path),
-        "table_description": f"Table from benchmark dataset",
-        "dataset_description": "Benchmark dataset for table union search"
-    }
-
-def prepare_benchmark_data(benchmark_name, data_root="data", output_root="processed_data", train_ratio=0.7, val_ratio=0.15):
-    """
-    Prepare benchmark data for TabSketchFM training.
+def prepare_benchmark_data(benchmark_name):
+    """Prepare data for training TabSketchFM on a benchmark dataset."""
     
-    Args:
-        benchmark_name: Name of the benchmark (santos, tus, etc.)
-        data_root: Root directory containing benchmark data
-        output_root: Directory for processed data
-        train_ratio: Ratio of data for training
-        val_ratio: Ratio of data for validation
-    """
-    # Create necessary directories
-    benchmark_dir = os.path.join(data_root, benchmark_name)
-    datalake_dir = os.path.join(benchmark_dir, "datalake")
-    query_dir = os.path.join(benchmark_dir, "query")
+    # Create directory structure
+    output_dir = Path("processed_data") / benchmark_name
+    processed_dir = output_dir / "processed"
+    metadata_dir = output_dir / "metadata"
     
-    output_dir = os.path.join(output_root, benchmark_name)
-    metadata_dir = os.path.join(output_dir, "metadata")
-    processed_dir = os.path.join(output_dir, "processed")
+    # Clean previous runs if they exist
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
     
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(metadata_dir, exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
-    
+    os.makedirs(metadata_dir, exist_ok=True)
+
     # Load ground truth
-    with open(os.path.join(benchmark_dir, "benchmark.pkl"), 'rb') as f:
-        ground_truth = pickle.load(f)
-    
-    # Collect all unique tables
-    all_tables = set()
-    for query, matches in ground_truth.items():
-        all_tables.add(query)
-        all_tables.update(matches)
-    
-    # Create metadata files and copy CSVs to output directory
-    for table in all_tables:
-        # Determine source directory (query or datalake)
-        if table in ground_truth:
-            src_dir = query_dir
-        else:
-            src_dir = datalake_dir
-            
-        # Copy CSV file
-        src_path = os.path.join(src_dir, table)
-        if not os.path.exists(src_path):
-            print(f"Warning: {table} not found in {src_dir}")
+    data_dir = Path("data") / benchmark_name
+    if not data_dir.exists():
+        raise ValueError(f"Benchmark data directory not found: {data_dir}")
+
+    # Process all tables from both query and datalake directories
+    processed_files = {}
+    for subdir in ['query', 'datalake']:
+        dir_path = data_dir / subdir
+        if not dir_path.exists():
             continue
             
-        # Create metadata
-        metadata = create_metadata(table)
-        metadata_path = os.path.join(metadata_dir, f"{table}.meta")
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        # Process each CSV file
+        for csv_file in dir_path.glob("*.csv"):
+            # Create metadata for the table
+            metadata = {
+                "table_name": csv_file.name,
+                "table_description": f"Table from {benchmark_name} {subdir}",
+                "dataset_description": f"{benchmark_name} benchmark dataset"
+            }
+            
+            # Save metadata
+            metadata_file = metadata_dir / f"{csv_file.name}.meta"
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f)
+            
+            # Process table
+            prep_data(str(csv_file), str(processed_dir), str(metadata_file))
+            
+            # Get the processed json file name (will be hash of original filename)
+            json_files = list(processed_dir.glob(f"*.json.bz2"))
+            if json_files:  # Take the most recent one
+                processed_files[csv_file.name] = f"processed/{json_files[-1].name}"  # Include processed/ in path
+
+    # Create train/valid/test splits
+    tables = list(processed_files.keys())
+    random.shuffle(tables)
     
-    # Create train/val/test splits
-    queries = list(ground_truth.keys())
-    random.shuffle(queries)
+    n = len(tables)
+    train_idx = int(0.7 * n)
+    val_idx = int(0.85 * n)
     
-    n_queries = len(queries)
-    train_size = int(n_queries * train_ratio)
-    val_size = int(n_queries * val_ratio)
-    
-    train_queries = queries[:train_size]
-    val_queries = queries[train_size:train_size + val_size]
-    test_queries = queries[train_size + val_size:]
-    
-    # Create splits file
     splits = {
         "train": [],
         "valid": [],
         "test": []
     }
     
-    # Helper function to add examples for a query and its matches
-    def add_examples(query_list, split):
-        for query in query_list:
-            # Add query table
-            example = {
-                "table": os.path.join(query_dir, query),
-                "metadata": os.path.join(metadata_dir, f"{query}.meta"),
-                "json": os.path.join(processed_dir, f"{hash(query)}.json.bz2"),
-                "column": 0  # We'll mask the first column by default
-            }
-            splits[split].append(example)
+    # Helper function to add tables to splits
+    def add_to_split(table_name, split):
+        if table_name not in processed_files:
+            return
             
-            # Add matching tables
-            for match in ground_truth[query]:
-                example = {
-                    "table": os.path.join(datalake_dir, match),
-                    "metadata": os.path.join(metadata_dir, f"{match}.meta"),
-                    "json": os.path.join(processed_dir, f"{hash(match)}.json.bz2"),
-                    "column": 0
-                }
-                splits[split].append(example)
+        # For each table, add entries for each column
+        try:
+            df = pd.read_csv(data_dir / 'query' / table_name if (data_dir / 'query' / table_name).exists() 
+                           else data_dir / 'datalake' / table_name)
+            num_cols = len(df.columns)
+            
+            for col_idx in range(num_cols):
+                splits[split].append({
+                    "table": table_name,
+                    "json": processed_files[table_name],  # Now includes processed/ in path
+                    "column": col_idx
+                })
+        except Exception as e:
+            print(f"Error processing {table_name}: {str(e)}")
     
-    # Create examples for each split
-    add_examples(train_queries, "train")
-    add_examples(val_queries, "valid")
-    add_examples(test_queries, "test")
-    
+    # Add tables to splits
+    for table in tables[:train_idx]:
+        add_to_split(table, "train")
+    for table in tables[train_idx:val_idx]:
+        add_to_split(table, "valid")
+    for table in tables[val_idx:]:
+        add_to_split(table, "test")
+
     # Save splits file
-    splits_path = os.path.join(output_dir, "splits.json.bz2")
+    splits_path = output_dir / "splits.json.bz2"
     with bz2.open(splits_path, 'wt') as f:
-        json.dump(splits, f, indent=2)
-    
-    return output_dir, splits_path
+        json.dump(splits, f)
+
+    print(f"Created {len(splits['train'])} training examples")
+    print(f"Created {len(splits['valid'])} validation examples")
+    print(f"Created {len(splits['test'])} test examples")
+
+    return str(output_dir), str(splits_path)
 
 def train_tabsketchfm(benchmark_name):
-    """Train TabSketchFM on the prepared benchmark data."""
-    # Prepare the data
+    """Train TabSketchFM on a benchmark dataset."""
     output_dir, splits_path = prepare_benchmark_data(benchmark_name)
     
-    # Create command to run pretrain.py
     cmd = f"""
-    python pretrain.py \
-        --accelerator {'gpu' if torch.cuda.is_available() else 'cpu'} \
-        --devices 1 \
-        --max_epochs 40 \
-        --save_bert_model \
-        --bert_model_path ./models/{benchmark_name}_model \
-        --dataset {splits_path} \
-        --data_dir {output_dir} \
+    python pretrain.py \\
+        --accelerator 'gpu' \\
+        --devices 1 \\
+        --max_epochs 40 \\
+        --save_bert_model \\
+        --bert_model_path ./models/{benchmark_name}_model \\
+        --dataset {splits_path} \\
+        --data_dir {output_dir} \\
         --random_seed 0
     """
-    
-    # Execute the command
     os.system(cmd)
 
 if __name__ == "__main__":
     import argparse
-    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--benchmark', type=str, choices=['santos', 'tus', 'tusLarge', 'pylon'],
-                      help='Benchmark to train on')
+    parser.add_argument('--benchmark', type=str, required=True,
+                       choices=['santos', 'tus', 'tusLarge', 'pylon'])
     args = parser.parse_args()
-    
     train_tabsketchfm(args.benchmark)
